@@ -846,58 +846,225 @@ local function doMicUnmute()
     warn("[MicToggle] Failed to unmute after 3 attempts")
 end
 
+----------------------------------------------------------------
+-- VC BAN (VCB): DETECTION, COUNTER, REJOIN, HYPERION NOTIFY
+----------------------------------------------------------------
 _G.VCBDetected = false
 _G.VCBTimerActive = false
+_G.HyperionRejoinPending = false
 
-local function isVCBanned()
-    local micFrame = findMicFrame()
-    return micFrame == nil
+-- Detection. Roblox removes the top-bar mic toggle while voice chat is suspended.
+-- A missing toggle alone is not proof (the account may have no voice chat, or the
+-- top bar hasn't built it yet), so a ban is only reported when voice chat was
+-- really available: the toggle was seen earlier this session, or the account is
+-- voice-enabled (VoiceChatService) but the toggle never showed up within the grace
+-- period. Two misses in a row are needed, so a top-bar rebuild can't trigger it.
+local VCB = { micSeen = false, misses = 0, startedAt = tick(), requireSeen = false, voiceChecked = false, voiceEnabled = false }
+local VCB_GRACE_SECS = 45
+local VCB_MISSES_NEEDED = 2
+
+local function voiceEnabledForMe()
+    if VCB.voiceChecked then return VCB.voiceEnabled end
+    VCB.voiceChecked = true
+    local ok, res = pcall(function()
+        return _Q("VoiceChatService"):IsVoiceEnabledForUserIdAsync(LocalPlayer.UserId)
+    end)
+    VCB.voiceEnabled = ok and res == true
+    return VCB.voiceEnabled
 end
 
-local function doRejoinTP()
+local function isVCBanned()
+    if findMicFrame() then
+        VCB.micSeen = true
+        VCB.misses = 0
+        return false
+    end
+    local eligible = VCB.micSeen
+        or (not VCB.requireSeen and tick() - VCB.startedAt >= VCB_GRACE_SECS and voiceEnabledForMe())
+    if not eligible then
+        VCB.misses = 0
+        return false
+    end
+    VCB.misses = VCB.misses + 1
+    return VCB.misses >= VCB_MISSES_NEEDED
+end
 
-    SaveBotPosition()
+-- Counter: how many times this account was VC banned, kept across sessions in the
+-- executor workspace (same storage as the bot position file).
+local VCB_FILE = "HyperionVCB_" .. LocalPlayer.Name .. ".json"
+_G.HyperionVCBCount = 0
+pcall(function()
+    if isfile and not isfile(VCB_FILE) then return end
+    local d = HttpService:JSONDecode(readfile(VCB_FILE))
+    _G.HyperionVCBCount = tonumber(d.count) or 0
+end)
+
+local function bumpVCBCount()
+    _G.HyperionVCBCount = (_G.HyperionVCBCount or 0) + 1
+    pcall(function()
+        writefile(VCB_FILE, HttpService:JSONEncode({ count = _G.HyperionVCBCount, last = os.time() }))
+    end)
+    return _G.HyperionVCBCount
+end
+
+-- Tell Hyperion Account Manager about VC bans / rejoins. Only while the bridge says
+-- Hyperion's Auto Execute is on (the bridge is the source of truth); otherwise
+-- nothing is sent. Never errors if the bridge is down.
+local function notifyAM(kind, extra)
+    if _G.HyperionAMAutoExec ~= true or type(_G.HyperionWSRaw) ~= "function" then return false end
+    local payload = { type = kind, name = LocalPlayer.Name, userId = LocalPlayer.UserId,
+                      vcbCount = _G.HyperionVCBCount or 0 }
+    for k, v in pairs(extra or {}) do payload[k] = v end
+    local ok, sent = pcall(function() return _G.HyperionWSRaw(HttpService:JSONEncode(payload)) end)
+    return ok and sent == true
+end
+
+-- Code queued to run in the NEW server after the teleport. It runs in a fresh
+-- environment (none of this script's locals exist there), so it may only use globals.
+local function queueAfterTeleport(rejoinId, managed)
+    local qot = Potassium.queueOnTeleport
+    if not qot then return false end
 
     local char = LocalPlayer.Character
-    if not char then return end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = hrp.CFrame:GetComponents()
+        pcall(qot, string.format([[
+            local targetCFrame = CFrame.new(%f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f)
+            local LP = game:GetService("Players").LocalPlayer
+            local function tpChar(c)
+                local r = c:WaitForChild("HumanoidRootPart", 15)
+                if r then task.wait(0.5); r.CFrame = targetCFrame end
+            end
+            if LP.Character then task.spawn(tpChar, LP.Character) end
+            LP.CharacterAdded:Connect(tpChar)
+        ]], x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22))
+    end
 
-    local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = hrp.CFrame:GetComponents()
-
-    local teleportCode = string.format([[
-        local targetCFrame = CFrame.new(%f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f, %f)
-        local Players = _Q("Players")
-        local LP = Players.LocalPlayer
-        local function tpChar(char)
-            local hrp = char:WaitForChild("HumanoidRootPart", 15)
-            if hrp then task.wait(0.5); hrp.CFrame = targetCFrame end
-        end
-        if LP.Character then tpChar(LP.Character) end
-        LP.CharacterAdded:Connect(tpChar)
-    ]], x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22)
-
-    local qot = Potassium.queueOnTeleport
-    if qot then
-
-        pcall(qot, teleportCode)
-
+    if managed and type(_G.HyperionWSURL) == "function" then
+        -- Hyperion re-runs the script: just report that the rejoin completed.
+        local msg = HttpService:JSONEncode({ type = "rejoined", name = LocalPlayer.Name, userId = LocalPlayer.UserId,
+                                             rejoinId = rejoinId, vcbCount = _G.HyperionVCBCount or 0 })
+        pcall(qot, string.format([[
+            task.spawn(function()
+                local WSL = WebSocket or (syn and syn.websocket) or websocket
+                if not WSL or not WSL.connect then return end
+                for _ = 1, 5 do
+                    local ok, c = pcall(function() return WSL.connect(%q) end)
+                    if ok and c then
+                        pcall(function() c:Send(%q) end)
+                        task.wait(1)
+                        pcall(function() c:Close() end)
+                        return
+                    end
+                    task.wait(%d)
+                end
+            end)
+        ]], _G.HyperionWSURL("notify"), msg, math.max(1, math.floor(getgenv().Settings.wsRetry or 5))))
+    else
+        -- Not run by Hyperion: re-run the script ourselves, as before.
         local scriptURL = getgenv().Settings.scriptLoadstring or ""
         local scriptFile = getgenv().Settings.scriptFile or ""
         if scriptFile ~= "" then
-
-            local reExecCode = 'task.wait(3); pcall(function() loadstring(readfile("' .. scriptFile .. '"))() end)'
-            pcall(qot, reExecCode)
+            pcall(qot, 'task.wait(3); pcall(function() loadstring(readfile("' .. scriptFile .. '"))() end)')
         elseif scriptURL ~= "" then
+            pcall(qot, 'task.wait(3); pcall(function() loadstring(request({Url="' .. scriptURL .. '",Method="GET"}).Body)() end)')
+        end
+    end
+    return true
+end
 
-            local reExecCode = 'task.wait(3); pcall(function() loadstring(request({Url="' .. scriptURL .. '",Method="GET"}).Body)() end)'
-            pcall(qot, reExecCode)
+-- Rejoin the same server. One rejoin per event (guarded), up to 3 attempts; the
+-- last attempt joins a new server of the same place if this one can't be rejoined.
+local REJOIN_ATTEMPTS = 3
+local REJOIN_FAIL_WAIT = 20
+
+local function doRejoinTP(reason)
+    if _G.HyperionRejoinPending then return false end
+    _G.HyperionRejoinPending = true
+    SaveBotPosition()
+
+    local managed = _G.HyperionAMAutoExec == true and _G.HyperionWSConnected == true
+    local rejoinId = HttpService:GenerateGUID(false)
+    notifyAM("rejoining", { rejoinId = rejoinId, reason = reason or "rejoin" })
+    queueAfterTeleport(rejoinId, managed)
+
+    task.spawn(function()
+        for attempt = 1, REJOIN_ATTEMPTS do
+            local failed = false
+            local conn = TeleportService.TeleportInitFailed:Connect(function(plr)
+                if plr == LocalPlayer then failed = true end
+            end)
+            local ok = pcall(function()
+                if attempt < REJOIN_ATTEMPTS then
+                    TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+                else
+                    TeleportService:Teleport(game.PlaceId, LocalPlayer)
+                end
+            end)
+            local t0 = tick()
+            while ok and not failed and tick() - t0 < REJOIN_FAIL_WAIT do task.wait(0.5) end
+            pcall(function() conn:Disconnect() end)
+            if ok and not failed then return end          -- teleport is under way
+            warn("[Rejoin] attempt " .. attempt .. " failed")
+            task.wait(2)
+        end
+        _G.HyperionRejoinPending = false
+        notifyAM("rejoin_failed", { rejoinId = rejoinId })
+        ChatSend("Rejoin failed ❌")
+    end)
+    return true
+end
+
+-- What happens once a ban is detected (also used by the "vcbtest" command).
+local function handleVCB(totalTime, isTest)
+    _G.VCBDetected = true
+    _G.VCBTimerActive = true
+    local count = bumpVCBCount()
+    notifyAM("vcb", { test = isTest == true })
+
+    local chatDelay = getgenv().Settings.vcbChatDelay or 0.3
+    local idx = SafeIndex()
+    task.wait(idx * chatDelay)
+    ChatSend("VCB Detected💀 (#" .. count .. (isTest and ", test" or "") .. ")")
+    task.wait(1)
+    ChatSend("Timer started - " .. math.max(1, math.floor(totalTime / 60)) .. "min ⏳")
+
+    local elapsed, sent3min, sent1min = 0, false, false
+    while elapsed < totalTime and _G.VCBTimerActive and _G.HyperionActive do
+        task.wait(1)
+        elapsed = elapsed + 1
+        local remaining = totalTime - elapsed
+        if remaining <= 180 and remaining > 179 and not sent3min then
+            sent3min = true
+            task.wait(idx * chatDelay)
+            ChatSend("3min left ⌛")
+        end
+        if remaining <= 60 and remaining > 59 and not sent1min then
+            sent1min = true
+            task.wait(idx * chatDelay)
+            ChatSend(getgenv().Settings.vcbAutoRejoin and "Rejoining in 1min..." or "1min left ⌛")
         end
     end
 
-    pcall(function()
-        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
-    end)
+    if _G.VCBTimerActive and _G.HyperionActive then
+        task.wait(idx * chatDelay)
+        ChatSend("Unbanned 😼")
+        if getgenv().Settings.vcbAutoRejoin then
+            task.wait(1)
+            ChatSend("Rejoining...")
+            task.wait(getgenv().Settings.rejoinDelay or 10)
+            doRejoinTP(isTest and "vcb-test" or "vcb")
+        end
+    end
+    _G.VCBTimerActive = false
+
+    if not _G.HyperionRejoinPending then
+        -- Stayed in this server: voice only comes back after a rejoin, so only
+        -- re-arm once the mic toggle has been seen again (no instant re-detect).
+        VCB.micSeen, VCB.misses, VCB.requireSeen = false, 0, true
+        _G.VCBDetected = false
+    end
 end
 
 local function StartVCBMonitor()
@@ -905,62 +1072,12 @@ local function StartVCBMonitor()
     if not isAltAccount then return end
 
     task.spawn(function()
-
         task.wait(10)
-
         while _G.HyperionActive do
             task.wait(getgenv().Settings.vcbCheckInterval or 5)
-
-            if not _G.VCBDetected and not _G.HyperionVCBDisabled and isVCBanned() then
-                _G.VCBDetected = true
-                _G.VCBTimerActive = true
-
-                local totalTime = getgenv().Settings.vcbTimerSeconds or 360
-                local chatDelay = getgenv().Settings.vcbChatDelay or 0.3
-                local idx = SafeIndex()
-
-                task.wait(idx * chatDelay)
-                ChatSend("VCB Detected💀")
-                task.wait(1)
-                ChatSend("Timer started - " .. math.floor(totalTime / 60) .. "min ⏳")
-
-                local elapsed = 0
-                local sent3min = false
-                local sent1min = false
-
-                while elapsed < totalTime and _G.VCBTimerActive do
-                    task.wait(1)
-                    elapsed = elapsed + 1
-                    local remaining = totalTime - elapsed
-
-                    if remaining <= 180 and remaining > 179 and not sent3min then
-                        sent3min = true
-                        task.wait(idx * chatDelay)
-                        ChatSend("3min left ⌛")
-                    end
-
-                    if remaining <= 60 and remaining > 59 and not sent1min then
-                        sent1min = true
-                        task.wait(idx * chatDelay)
-                        ChatSend("Rejoining in 1min...")
-                    end
-                end
-
-                if _G.VCBTimerActive then
-
-                    task.wait(idx * chatDelay)
-                    ChatSend("Unbanned 😼")
-                    task.wait(1)
-                    ChatSend("Rejoining...")
-
-                    task.wait(getgenv().Settings.rejoinDelay or 10)
-
-                    if getgenv().Settings.vcbAutoRejoin then
-                        doRejoinTP()
-                    end
-                end
-
-                _G.VCBTimerActive = false
+            if not _G.VCBDetected and not _G.HyperionVCBDisabled and not _G.HyperionRejoinPending
+                and isVCBanned() then
+                handleVCB(getgenv().Settings.vcbTimerSeconds or 360, false)
             end
         end
     end)
@@ -3092,6 +3209,37 @@ Commands.credits = function(args, speaker)
     end)
 end
 
+Commands.vcb = function(args, speaker)
+    if not IsSoloCommand(args) then return end
+    if isMainAccount then return end
+    task.spawn(function()
+        task.wait(SafeIndex() * 0.3)
+        ChatSend("[" .. LocalPlayer.Name .. "] VC bans: " .. tostring(_G.HyperionVCBCount or 0)
+            .. (_G.VCBTimerActive and " (banned now)" or ""))
+    end)
+end
+Commands.vcbcount = Commands.vcb
+
+Commands.vcbreset = function(args, speaker)
+    if not IsSoloCommand(args) then return end
+    if isMainAccount then return end
+    _G.HyperionVCBCount = 0
+    pcall(function() writefile("HyperionVCB_" .. LocalPlayer.Name .. ".json", HttpService:JSONEncode({ count = 0 })) end)
+    task.spawn(function()
+        task.wait(SafeIndex() * 0.3)
+        ChatSend("[" .. LocalPlayer.Name .. "] VC ban counter reset")
+    end)
+end
+
+-- Runs the real VC-ban path with a short timer, to test the counter, the rejoin and
+-- the Hyperion notification without a real ban:  vcbtest [seconds]
+Commands.vcbtest = function(args, speaker)
+    if not IsSoloCommand(args) then return end
+    if isMainAccount or _G.VCBDetected or _G.HyperionRejoinPending then return end
+    local secs = math.clamp(tonumber(args[2]) or 15, 5, 600)
+    task.spawn(handleVCB, secs, true)
+end
+
 Commands.altcount = function(args, speaker)
     if not IsSoloCommand(args) then return end
     if SafeIndex() == 1 then ChatSend("[System] Alts Online: " .. TotalBots()) end
@@ -3661,22 +3809,12 @@ end
 
 Commands.rejoin = function(args, speaker)
     if not IsSoloCommand(args) then return end
+    if _G.HyperionRejoinPending then return end
     StopAll()
-    SaveBotPosition()
     task.spawn(function()
         ChatSend("Rejoining...")
         task.wait(1)
-        local qot = Potassium.queueOnTeleport
-        if qot then
-            local scriptFile = getgenv().Settings.scriptFile or ""
-            local scriptURL = getgenv().Settings.scriptLoadstring or ""
-            if scriptFile ~= "" then
-                pcall(qot, 'task.wait(3); pcall(function() loadstring(readfile("' .. scriptFile .. '"))() end)')
-            elseif scriptURL ~= "" then
-                pcall(qot, 'task.wait(3); pcall(function() loadstring(request({Url="' .. scriptURL .. '",Method="GET"}).Body)() end)')
-            end
-        end
-        pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer) end)
+        doRejoinTP("command")
     end)
 end
 
@@ -3948,7 +4086,7 @@ local function GetCommandList()
         "replicate","replicate1-3","unreplicate","clone","loopclone","unloopclone",
         "w","mimic","unmimic","friend","block","npc","say","spam","unspam","countdown","credits","report",
         "pvp","grab","grab near","gentool",
-        "ping","ram","uptime","altcount","index","cmds",
+        "ping","ram","uptime","altcount","index","vcb","vcbreset","vcbtest [sec]","cmds",
         "tp","scatter","antivoid","unantivoid","whitelist [count]","blacklist [all]","stop","rejoin","quit",
     }
 end
@@ -4285,6 +4423,8 @@ if isMainAccount then
                 {cmd="uptime",  desc="Core session length",                    ha=false},
                 {cmd="altcount",desc="Counts total units",                     ha=false},
                 {cmd="index",   desc="Announces own index",                     ha=false},
+                {cmd="vcb",     desc="Counts VC bans",                          ha=false},
+                {cmd="vcbtest", desc="Simulates a VC ban",                      al="[Seconds]", ha=false},
                 {cmd="cmds",    desc="Presents command list",                   ha=false},
             },
         },
@@ -5201,11 +5341,15 @@ if getgenv().Settings.wsEnabled then
                 task.spawn(onCommand, data.text, data.speaker)
             elseif data.type == "status" then
                 _G.HyperionWSStatus = { bots = tonumber(data.bots) or 0 }
+            elseif data.type == "hyperion" then
+                -- Hyperion Account Manager's state (source of truth for notifications)
+                _G.HyperionAMAutoExec = data.autoExecute == true
             end
         end))
 
         getgenv().TrackConnection(conn.OnClose:Connect(function()
             _G.HyperionWSConnected = false; WS = nil; _G.HyperionWS = nil
+            _G.HyperionAMAutoExec = false
             _G.HyperionWSLog("disconnected - retrying", "warn")
             task.delay(getgenv().Settings.wsRetry or 5, connect)
         end))
@@ -5231,6 +5375,18 @@ if getgenv().Settings.wsEnabled then
         return ok
     end
     _G.HyperionWSSend = wsSend
+
+    -- Raw JSON to the bridge (VC ban / rejoin notices); false if not connected.
+    _G.HyperionWSRaw = function(json)
+        if not WS or not _G.HyperionWSConnected then return false end
+        return (pcall(function() WS:Send(json) end))
+    end
+    -- Bridge URL for another role (used by the post-teleport notifier).
+    _G.HyperionWSURL = function(asRole)
+        local base  = (getgenv().Settings.wsURL or "ws://127.0.0.1:8080"):gsub("/+$", "")
+        return string.format("%s/?token=%s&role=%s&name=%s", base,
+            HttpService:UrlEncode(getgenv().Settings.wsToken or ""), asRole or role, HttpService:UrlEncode(LocalPlayer.Name))
+    end
 
     if isMainAccount then
         local UI  = HyperionUI
