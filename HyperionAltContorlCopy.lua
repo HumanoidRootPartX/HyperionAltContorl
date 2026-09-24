@@ -16,9 +16,9 @@ getgenv().Settings = {
     altAccounts = {
         ["hyperionalt01"] = true,
         ["hyperionalt02"] = true,
-		    ["hyperionalt03"] = true,
-		    ["hyperionalt04"] = true,
-		    ["hyperionalt05"] = true,
+		["hyperionalt03"] = true,
+		["hyperionalt04"] = true,
+		["hyperionalt05"] = true,
     };
 
     -- ═══════════════════════════════════════════
