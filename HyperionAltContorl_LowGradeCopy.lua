@@ -1088,11 +1088,19 @@ local MusicState = {
     lastPlayTime = {},
 }
 
+-- The music bot is optional: it only runs when Settings.musicBotAccount names an
+-- account. Without music settings (e.g. from Hyperion Account Manager) it stays off.
+local function musicEnabled()
+    local acct = getgenv().Settings.musicBotAccount
+    return type(acct) == "string" and acct ~= ""
+end
+
 local function isMusicDesignatedBot()
-    return LocalPlayer.Name == getgenv().Settings.musicBotAccount
+    return musicEnabled() and LocalPlayer.Name == getgenv().Settings.musicBotAccount
 end
 
 local function shouldMusicExecute()
+    if not musicEnabled() then return false end
 
     if isMusicDesignatedBot() then return true end
 
@@ -4621,7 +4629,7 @@ end
 local MusicCommands = {}
 
 MusicCommands.play = function(player, args, rawMessage)
-    local prefix = getgenv().Settings.musicPrefix
+    local prefix = getgenv().Settings.musicPrefix or "/"
     local query = rawMessage:sub(#prefix + 5):gsub("^%s+", ""):gsub("%s+$", "")
     if #query < 2 then musicChat("❌ Search query too short!"); return end
 
@@ -4909,6 +4917,7 @@ local musicCmdMap = {
 }
 
 local function SetupMusicListener(p)
+    if not musicEnabled() then return end
     getgenv().TrackConnection(p.Chatted:Connect(function(msg)
         local mPrefix = getgenv().Settings.musicPrefix or "/"
         if not msg or #msg == 0 then return end
