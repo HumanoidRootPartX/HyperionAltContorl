@@ -1,4 +1,3 @@
-}
 local _Q = (function(lI, Il)
     local l1 = {}
     for I1 = 1, #lI do
