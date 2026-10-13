@@ -5,8 +5,8 @@ getgenv().Settings = {
     -- ═══════════════════════════════════════════
     --  ALT CONTROL
     -- ═══════════════════════════════════════════
-    prefix      = "`";
-    mainAccount = "ObfuscatedHumanoid";
+    prefix      = "!";
+    mainAccount = "xhy_perion"; -- PUT YOUR MAIN ACCOUNT HERE
     fpsCap      = 10;
     weldFpsCap  = 60;     -- FPS bots run at WHILE welded (orbit/formations…); fpsCap returns when the weld stops. 0 = leave the cap alone
     weldIdleAnim = true;  -- Welded bots loop their own idle animation (PlatformStand would otherwise freeze them in the rest pose)
@@ -14,11 +14,11 @@ getgenv().Settings = {
     replicatePin = false;      -- Replicate RootPart weld. false = smooth TweenService follow (default).
     GetHUI_BlackScreen = true; -- set false to disable GetHUI black screen on alts
     altAccounts = {
-        ["hyperionalt01"] = true,
+        ["hyperionalt01"] = true, -- CHANGE TO YOUR ALT ACCOUNT USERNAMES
         ["hyperionalt02"] = true,
 		["hyperionalt03"] = true,
 		["hyperionalt04"] = true,
-		["hyperionalt05"] = true,
+		["hyperionalt05"] = true, -- YOU CAN ADD AS MUCH AS U WANT FOLLOWED BY ,
     };
 
     -- ═══════════════════════════════════════════
