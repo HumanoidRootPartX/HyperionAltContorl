@@ -64,4 +64,5 @@ getgenv().Settings = {
     wsURL     = "ws://127.0.0.1:8080";      -- Same host:port as server.py (use your LAN IP for multi-PC)
     wsToken   = "CHANGE_ME_SECRET";         -- MUST match TOKEN in server.py
     wsRetry   = 5;                          -- Seconds between reconnect attempts
+}
 loadstring(game:HttpGet("https://raw.githubusercontent.com/HumanoidRootPartX/HyperionAltContorl/refs/heads/main/HyperionAltContorl_LowGradeCopy.lua"))()
